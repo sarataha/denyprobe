@@ -25,8 +25,8 @@ SUBJECT_DSN=<agent dsn> OPERATOR_DSN=<admin dsn> uv run probe_postgres.py --like
 ```
 
 - The database needs the comment `denyprobe-scratch`.
-- `--like` copies a real table's grants onto a canary table, so real data isn't touched.
+- `--like` copies a real table's schema, owner and grants onto a canary table, so real data isn't touched. The operator must be able to give the canary to that owner (a superuser, or a member of the owner's role).
 
 ## Output
 
-`PASS` blocked, `FAIL` landed, `UNKNOWN` the control check failed. Exits 1 on any `FAIL` or `UNKNOWN`.
+`PASS` blocked, `FAIL` landed, `UNKNOWN` the control check failed or the probe failed for a reason that says nothing about permissions (on Postgres, any error other than permission denied or read-only). Exits 1 on any `FAIL` or `UNKNOWN`, 2 if it could not run.

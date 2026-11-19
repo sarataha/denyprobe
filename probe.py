@@ -16,6 +16,7 @@ import argparse
 import base64
 import json
 import os
+import secrets
 import subprocess
 import sys
 import tempfile
@@ -64,11 +65,18 @@ def api(method, path, token, body=None):
         },
     )
     try:
-        with urllib.request.urlopen(req) as resp:
+        with urllib.request.urlopen(req, timeout=30) as resp:
             raw = resp.read()
             return resp.status, json.loads(raw) if raw else None
     except urllib.error.HTTPError as e:
         return e.code, None
+    except (urllib.error.URLError, TimeoutError):
+        return 0, None
+
+
+def die(msg):
+    print(msg, file=sys.stderr)
+    sys.exit(2)
 
 
 def redact(text, *secrets):
@@ -78,44 +86,73 @@ def redact(text, *secrets):
     return text
 
 
-def git(args, cwd, *secrets):
-    r = subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
-    return r.returncode, redact(r.stdout + r.stderr, *secrets).strip()
+# No credential helper may store the tokens in the URLs, signing may not break the commit,
+# and git must never stop to prompt for a password. Hooks are skipped with --no-verify.
+GIT_OPTS = ["-c", "credential.helper=", "-c", "commit.gpgsign=false"]
+GIT_ENV = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+
+
+def git(args, cwd, *tokens):
+    r = subprocess.run(["git", *GIT_OPTS, *args], cwd=cwd, capture_output=True, text=True,
+                       env=GIT_ENV)
+    return r.returncode, redact(r.stdout + r.stderr, *tokens).strip()
 
 
 def guard(repo, op_token):
     status, data = api("GET", f"/repos/{repo}", op_token)
     if status != 200:
-        sys.exit(f"cannot read {repo} with OPERATOR_TOKEN (HTTP {status})")
+        die(f"cannot read {repo} with OPERATOR_TOKEN (HTTP {status})")
     if GUARD_TOPIC not in (data.get("topics") or []):
-        sys.exit(f"{repo} lacks the '{GUARD_TOPIC}' topic; refusing to run")
+        die(f"{repo} lacks the '{GUARD_TOPIC}' topic; refusing to run")
     return data["default_branch"]
 
 
-def landed(repo, path, branch, op_token):
-    status, _ = api("GET", f"/repos/{repo}/contents/{path}?ref={branch}", op_token)
-    return status == 200
+def branch_sha(repo, branch, op_token):
+    """Commit the branch points at, or None if the operator could not read it."""
+    status, data = api("GET", f"/repos/{repo}/git/ref/heads/{branch}", op_token)
+    if status != 200 or not data:
+        return None
+    return data["object"]["sha"]
 
 
-def probe(repo, workdir, push_url, base, i, path, content, sub_token, op_token):
-    branch = f"denyprobe/run-{i}"
-    _, base_ref = api("GET", f"/repos/{repo}/git/ref/heads/{base}", op_token)
+def unknown(path, detail):
+    return {"path": path, "verdict": "UNKNOWN", "git": detail}
+
+
+def probe(repo, workdir, push_url, base, run_id, i, path, content, sub_token, op_token):
+    branch = f"denyprobe/{run_id}-{i}"
+    base_sha = branch_sha(repo, base, op_token)
+    if not base_sha:
+        return unknown(path, f"could not read {base}")
     status, _ = api("POST", f"/repos/{repo}/git/refs", op_token,
-                    {"ref": f"refs/heads/{branch}", "sha": base_ref["object"]["sha"]})
+                    {"ref": f"refs/heads/{branch}", "sha": base_sha})
     if status != 201:
-        return {"path": path, "verdict": "UNKNOWN", "detail": f"could not create {branch} (HTTP {status})"}
+        return unknown(path, f"could not create {branch} (HTTP {status})")
     try:
-        git(["checkout", "-q", "-B", branch, f"origin/{base}"], workdir)
+        code, out = git(["checkout", "-q", "-B", branch, f"origin/{base}"], workdir)
+        if code != 0:
+            return unknown(path, f"checkout failed: {out}")
         full = os.path.join(workdir, path)
         os.makedirs(os.path.dirname(full), exist_ok=True)
         with open(full, "w") as f:
-            f.write(content)
-        git(["add", path], workdir)
-        git(["-c", "user.name=denyprobe", "-c", "user.email=denyprobe@invalid",
-             "commit", "-q", "-m", f"denyprobe canary {path}"], workdir)
-        code, out = git(["push", push_url, f"HEAD:refs/heads/{branch}"], workdir, sub_token)
-        present = landed(repo, path, branch, op_token)
-        return {"path": path, "push_exit": code, "landed": present, "git": out[-400:]}
+            # The run id makes the content new, so the commit is never empty even when a
+            # copy of the canary is already in the repo.
+            f.write(f"# denyprobe {run_id}\n{content}")
+        for step, args in (("add", ["add", "--force", path]),
+                           ("commit", ["-c", "user.name=denyprobe", "-c", "user.email=denyprobe@invalid",
+                                       "commit", "-q", "--no-verify", "-m", f"denyprobe canary {path}"])):
+            code, out = git(args, workdir)
+            if code != 0:
+                return unknown(path, f"git {step} failed: {out}")
+        _, commit = git(["rev-parse", "HEAD"], workdir)
+        code, out = git(["push", "--no-verify", push_url, f"HEAD:refs/heads/{branch}"],
+                        workdir, sub_token)
+        # The push landed only if the branch now points at this run's commit. Checking that
+        # the file exists would also match a copy already on the base branch.
+        now = branch_sha(repo, branch, op_token)
+        if not now:
+            return unknown(path, f"could not read {branch} back after the push\n{out}")
+        return {"path": path, "push_exit": code, "landed": now == commit, "git": out[-400:]}
     finally:
         api("DELETE", f"/repos/{repo}/git/refs/heads/{branch}", op_token)
 
@@ -139,7 +176,7 @@ def main():
     sub_token = os.environ.get("SUBJECT_TOKEN")
     op_token = os.environ.get("OPERATOR_TOKEN")
     if not sub_token or not op_token:
-        sys.exit("set SUBJECT_TOKEN and OPERATOR_TOKEN")
+        die("set SUBJECT_TOKEN and OPERATOR_TOKEN")
 
     base = guard(a.repo, op_token)
     push_url = a.git_url.format(repo=a.repo, token=sub_token)
@@ -150,10 +187,12 @@ def main():
         code, out = git(["clone", "-q", "--depth", "1", "--branch", base, clone_url, workdir],
                         None, op_token)
         if code != 0:
-            sys.exit(f"clone failed: {out}")
+            die(f"clone failed: {out}")
+        run_id = secrets.token_hex(4)
         control_ok = True
         for i, (path, content, expected) in enumerate(DEFAULT_PROBES):
-            r = probe(a.repo, workdir, push_url, base, i, path, content, sub_token, op_token)
+            r = probe(a.repo, workdir, push_url, base, run_id, i, path, content,
+                      sub_token, op_token)
             r["expected"] = expected
             r["verdict"] = verdict(r, expected) if control_ok else "UNKNOWN"
             if expected == "allowed" and r["verdict"] != "PASS":
